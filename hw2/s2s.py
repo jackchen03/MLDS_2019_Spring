@@ -16,7 +16,7 @@ import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "1" 
 from data_preprocessing import pad_sequences
 
-BATCH_SIZE = 16
+BATCH_SIZE = 32
 TIME_STEP = 100
 SENTENCE_MAX_LEN = 20
 INPUT_SIZE = 4096
@@ -25,7 +25,7 @@ HIDDEN_SIZE = 256
 EMBED_SIZE = 256
 # LSTM_IN_SIZE = 128
 TEACHER_FORCE_PROB = 0.8
-TEACHER_FORCE_PROB_2 = 0.4
+TEACHER_FORCE_PROB_2 = 0.2
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -37,44 +37,31 @@ class Encoder(nn.Module):
     self.lstm1 = nn.LSTM(input_size = INPUT_SIZE, hidden_size = HIDDEN_SIZE, batch_first = True)
     self.lstm2 = nn.LSTM(input_size =  HIDDEN_SIZE, hidden_size = HIDDEN_SIZE, batch_first = True)
    
-  def forward(self, input_seqs):
-    mid, (hidden1, cell1) = self.lstm1(input_seqs, None)
-    #pad_token = pad_token.repeat(input_seqs.shape[0], 80, 1)
-    #new_mid = torch.cat((pad_token, mid), 2)
-    outputs, (hidden2, cell2) = self.lstm2(mid, None)
-    
+  def forward(self, input_seqs,hc_init):
+    mid, (hidden1, cell1) = self.lstm1(input_seqs, hc_init)
+    outputs, (hidden2, cell2) = self.lstm2(mid, hc_init) 
+    #print("h1={}, c1={}, h2={}, c2={}".format(hidden1, cell1, hidden2, cell2))
+    #print("h1={}".format(hidden1[0][0])) 
     return outputs, (hidden1, cell1), (hidden2, cell2)
 
-class Attn():
+class Attn(nn.Module):
     def __init__(self):
+        super(Attn, self).__init__()
         self.hidden_size = HIDDEN_SIZE
 
     def forward(self, hidden, encoder_outputs):
-        length = encoder_outputs.size(1)
-        batch_size = encoder_outputs.size(0)
+        attn_energies = self.dot_score(hidden, encoder_outputs) #(BATCH_SIZE,80)
+        return F.softmax(attn_energies, dim = 1).unsqueeze(1) #(BATCH_SIZE,1,80) (for multiplication)
 
-        # Create variable to store attention energies
-        attn_energies = torch.zeros(batch_size, length).cuda() # B x S
-
-        # For each batch of encoder outputs
-        for b in range(batch_size):
-            # Calculate energy for each encoder output
-            for i in range(length):
-                attn_energies[b, i] = self.score(hidden[:,b,:], encoder_outputs[b, i].unsqueeze(0))
-
-        alpha = F.softmax(attn_energies, dim = 1).float()
-        h = encoder_outputs.float()
-
-        a = torch.zeros(batch_size, HIDDEN_SIZE).cuda()
-        for i in range(h.shape[1]):
-            temp = h[:,i,:].clone() * alpha[:,i].unsqueeze(1)
-            a = a + temp
-        return torch.unsqueeze(a, 1)
-
-    def score(self, hidden, encoder_output):
+    #def score(self, hidden, encoder_output):
         # hidden [1, HIDDEN_SIZE], encoder_output [1, HIDDEN_SIZE]
-        energy = hidden.squeeze(0).dot(encoder_output.squeeze(0))
-        return energy
+        #energy = hidden.squeeze(0).dot(encoder_output.squeeze(0))
+        #return energy
+
+    def dot_score(self, hidden, encoder_output):
+        # hidden(out)  (BATCH_SIZE,1,256)
+        # encoder(out) (BATCH_SIZE,80,256)
+        return torch.sum(hidden*encoder_output,dim=2)
 
 class Decoder(nn.Module):
   def __init__(self):
@@ -84,64 +71,68 @@ class Decoder(nn.Module):
     self.lstm2 = nn.LSTM(input_size = EMBED_SIZE+ HIDDEN_SIZE, hidden_size = HIDDEN_SIZE , batch_first = True)
     self.attn = Attn()
    
-  def forward(self, input_embed, encoder_outputs, hidden1, cell1, hidden2, cell2):
-    # pad_token = pad_token.repeat(input_word.shape[0], 1, 1)
-    # input_embed = 1 X 512
-    context_vector = self.attn.forward(hidden1, encoder_outputs)
-    mid, (hidden_out_1, cell_out_1) = self.lstm1(context_vector, (hidden1, cell1))
-    
-    new_mid = torch.cat((input_embed, mid), 2)
+  def forward(self, last_word, encoder_outputs, last_context, hidden1, cell1, hidden2, cell2):
+    paddings = torch.zeros(last_word.shape[0],1,EMBED_SIZE,device=torch.device(device))#(BATCH_SIZE, 1, 256)
+    #print(context_vector.shape)
+    #h,c: (1,BATCH_SIZE,256)
+    mid, (hidden_out_1, cell_out_1) = self.lstm1(paddings, (hidden1, cell1))
+    new_mid = torch.cat((last_word, mid), 2) #(BATCH_SIZE, 1, 512)
     outputs, (hidden_out_2, cell_out_2) = self.lstm2(new_mid, (hidden2, cell2))
 
-    return outputs, hidden_out_1, cell_out_1, hidden_out_2, cell_out_2
+    attn_weights = self.attn(outputs, encoder_outputs) #(BATCH_SIZE,1,80)
+    context = attn_weights.bmm(encoder_outputs)        #(BATCH_SIZE,1,EMBED_SIZE) 
+
+    return outputs, context, hidden_out_1, cell_out_1, hidden_out_2, cell_out_2
   
 class Seq2Seq(nn.Module):
   def __init__(self):
     super().__init__()
-    
     self.encoder =  Encoder()
     self.decoder = Decoder()
-    self.out_net = nn.Linear(HIDDEN_SIZE, VOCAB_SIZE).cuda()
+    self.out_net = nn.Linear(EMBED_SIZE, VOCAB_SIZE)
+    self.embedding = nn.Embedding(num_embeddings = VOCAB_SIZE, embedding_dim = EMBED_SIZE, padding_idx = 0)
     
-  def forward(self, src, target, bos_idx, epoch_num, is_train):
-    encoder_outputs, (hidden1, cell1), (hidden2, cell2) = self.encoder(src)
-    
+  def forward(self, src, target, bos_idx, epoch_num, is_train=True, total_epoch=0):
+    #randn_h = torch.randn(1,src.shape[0],EMBED_SIZE).to(device)
+    #randn_c = torch.randn(1,src.shape[0],EMBED_SIZE).to(device)
+    hc_init = None
+    encoder_outputs, (hidden1, cell1), (hidden2, cell2) = self.encoder(src,hc_init)
+    #print("h1={}".format(hidden1)) 
     input = bos_idx
-    embedding = nn.Embedding(num_embeddings = VOCAB_SIZE, embedding_dim = EMBED_SIZE, padding_idx = 0).cuda()
-    input_emb = embedding(input)
-    # 1 X 512
-
+    input_emb = self.embedding(input) #last word
 
     outputs = []
+    context = torch.zeros(src.shape[0],1,EMBED_SIZE).to(device) #context vector at each time step
     for t in range(SENTENCE_MAX_LEN):
-        output, hidden1, cell1, hidden2, cell2 = self.decoder(input_emb, encoder_outputs, hidden1, cell1, hidden2, cell2)
-        final_out = self.out_net(output )
-      
+        #print(input_emb[0]) 
+        output, context, hidden1, cell1, hidden2, cell2 = self.decoder(input_emb, encoder_outputs, context, hidden1, cell1, hidden2, cell2)
+        #print(torch.cat((output,context),dim=2).shape)
+        #final_out = self.out_net(torch.cat((output,context),dim=2))
+        final_out = self.out_net(output)
         outputs.append(final_out)
+
         if(is_train):
-            if(epoch_num > 5):
-                teacher_force_prob = TEACHER_FORCE_PROB_2
-            else :
-                teacher_force_prob = TEACHER_FORCE_PROB
-            n, p = 1, teacher_force_prob  # number of trials, probability of each trial
+            #if(epoch_num > 100):
+            #    teacher_force_prob = TEACHER_FORCE_PROB_2
+            #else :
+            #    teacher_force_prob = TEACHER_FORCE_PROB
+            n, p = 1, 1-epoch_num/total_epoch  # number of trials, probability of each trial
             teacher = np.random.binomial(n, p, 1)[0]
         else :
             teacher = 0
-
+        #teacher=0
         if(teacher):
-            input_emb = embedding(target[:,t].unsqueeze(1))
-            # _, indices = torch.max(final_out, 2)
-            # print(indices.shape)
+            input_emb = self.embedding(target[:,t].unsqueeze(1))
         else:
             # argmax of output
-            # final_out = 64 X 1 X 2880
+            # final_out = BATCH_SIZE X 1 X 2880
             _, indices = torch.max(final_out, 2)
-            input_emb = embedding(indices)
-    # print("finish forward once")
+            # indices = BATCH_SIZE X 1
+            input_emb = self.embedding(indices)
     return torch.cat(tuple(outputs), 1)
 
 
-def train(model, iterator, optimizer, loss_function, clip, epoch_num):
+def train(model, iterator, optimizer, loss_function, epoch_num, clip,index2word, total_epoch):
   model.cuda()
   model.train()
   epoch_loss = 0
@@ -154,23 +145,15 @@ def train(model, iterator, optimizer, loss_function, clip, epoch_num):
     message = "batch" + str(i) + " starts"
     print(message, end = "\r")
     bos_idx = torch.ones(src.shape[0],1,dtype=torch.long,device=torch.device(device))
-    #sentence = sentence.view(len(sentence), 1)
-    #embedding = nn.Embedding(num_embeddings = 2880, embedding_dim = VOCAB_SIZE, padding_idx = 0)
-    #embedding(sentence)
-
-    #one_hotted
-    # trg_one_hot_vec=[]
-    # for sentence in trg_pad:
-    #    sentence = sentence.view(len(sentence),1)
-    #    one_hot = torch.zeros(trg_pad.shape[1], vocab_size, dtype = torch.float32, device = torch.device(device)).clone()
-    #    one_hot = one_hot.scatter_(1,sentence.long(), 1)
-    #    trg_one_hot_vec.append(one_hot)
-
-    # trg_one_hot_vec = torch.stack(trg_one_hot_vec) #tensor of one-hot encodings
 
     optimizer.zero_grad()
 
-    output = model(src.float(), trg_pad, bos_idx, epoch_num, True)
+    output = model(src.float(), trg_pad, bos_idx, epoch_num, True,total_epoch)
+    _, outmax = torch.max(output,2)#(BATCH_SIZE,20)
+    line = " "
+    for sentence in outmax:
+        outwords = line.join([index2word[i.item()] for i in sentence if i.item()!=0])
+        #print(outwords)
     output = output[:].view(-1, output.shape[-1])
     trg_pad = trg_pad[:].view(-1)
     
@@ -183,20 +166,12 @@ def train(model, iterator, optimizer, loss_function, clip, epoch_num):
     optimizer.step()
 
     epoch_loss += loss.item()
-    print("batch ends")
-
+    #print("batch ends", end = '\r')
+    #print(len(iterator.dataset))
   train_loss = epoch_loss/len(iterator.dataset)
   print('\n Train set: Average loss: {:.5f}'.format(train_loss))
 
 
   return train_loss
-
-
-
-
-
-
-
-
 
 

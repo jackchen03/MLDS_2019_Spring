@@ -84,6 +84,8 @@ def pad_sequences(sequences, maxlen=None, dtype='int32',
             x[idx, -len(trunc):] = trunc
         else:
             raise ValueError('Padding type "%s" not understood' % padding)
+    #transpose -> (max_length, len(sequence))
+    #x = x.transpose()
     return x
 
 def build_dictionary(sentences,min_count):
@@ -133,11 +135,11 @@ if __name__=="__main__":
     video_IDs = [filename[:-4] for filename in video_feat_filenames]
     #print(video_IDs)
 
-    """video_feat_dict = {} #store video features
+    video_feat_dict = {} #store video features
     for path in video_feat_filepaths:
         video_feat = np.load(path)
         video_ID = path[:-4].replace(video_feat_folder,"")
-        video_feat_dict[video_ID] = video_feat"""
+        video_feat_dict[video_ID] = video_feat
 
     #store video captions
     video_captions = json.load(open(training_label_json_file,'r'))
@@ -155,13 +157,13 @@ if __name__=="__main__":
     word2index, index2word, dictionary = build_dictionary(caption_corpus,min_count=3)
     #print(video_caption_dict)
 
-    with open('./word2index_test.obj','wb') as file:
+    with open('./word2index_trans.obj','wb') as file:
         pickle.dump(word2index,file,protocol=pickle.HIGHEST_PROTOCOL)
-    with open('./index2word_test.obj','wb') as file:
+    with open('./index2word_trans.obj','wb') as file:
         pickle.dump(index2word,file,protocol=pickle.HIGHEST_PROTOCOL)
-    with open('video_IDs_test.obj', 'wb') as file:
+    with open('video_IDs_trans.obj', 'wb') as file:
         pickle.dump(video_IDs,file,protocol=pickle.HIGHEST_PROTOCOL)
-    with open('video_caption_dict_test.obj', 'wb') as file:
+    with open('video_caption_dict_trans.obj', 'wb') as file:
         pickle.dump(video_caption_dict,file,protocol=pickle.HIGHEST_PROTOCOL)
-    """with open('video_feat_dict.obj', 'wb') as file:
-        pickle.dump(video_feat_dict,file,protocol=pickle.HIGHEST_PROTOCOL)"""
+    with open('video_feat_dict_trans.obj', 'wb') as file:
+        pickle.dump(video_feat_dict,file,protocol=pickle.HIGHEST_PROTOCOL)
